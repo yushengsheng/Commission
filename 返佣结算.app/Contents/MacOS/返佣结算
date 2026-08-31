@@ -1,0 +1,47 @@
+#!/bin/zsh
+# Finder launches this executable directly; no Terminal window is needed.
+set -u
+umask 077
+PROJECT_DIR="${0:A:h:h:h:h}"
+
+show_error() {
+  print -u2 -r -- "$1"
+  # Pass text as an argument rather than interpolating paths into AppleScript.
+  /usr/bin/osascript - "$1" <<'APPLESCRIPT'
+on run argv
+    display alert "返佣结算启动失败" message (item 1 of argv) as critical buttons {"好"} default button "好"
+end run
+APPLESCRIPT
+}
+
+if [[ ! -f "$PROJECT_DIR/app.py" ]]; then
+  show_error "找不到 app.py。请将‘返佣结算.app’放回返佣结算系统项目文件夹，再双击启动。可以把 App 拖入程序坞，或制作替身，不要单独移走 App。"
+  exit 1
+fi
+if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+  show_error "缺少 Python 运行环境。请按照项目 README.md 的启动说明恢复 .venv 环境。"
+  exit 1
+fi
+cd -- "$PROJECT_DIR" || exit 1
+
+# Read-only startup validation for automated checks; does not open a window.
+if [[ "${1:-}" == "--check" ]]; then
+  exec "$PROJECT_DIR/.venv/bin/python" -c 'import app, rebate_engine, exporter, worker; print("返佣结算启动环境正常")'
+fi
+
+LOG_DIR="$PROJECT_DIR/artifacts"
+if ! mkdir -p -- "$LOG_DIR"; then
+  show_error "无法创建项目 artifacts 日志目录，请检查项目文件夹的写入权限。"
+  exit 1
+fi
+LOG_FILE="$LOG_DIR/launcher.log"
+if ! touch -- "$LOG_FILE"; then
+  show_error "无法写入启动日志，请检查项目 artifacts 文件夹的写入权限。"
+  exit 1
+fi
+"$PROJECT_DIR/.venv/bin/python" -u "$PROJECT_DIR/app.py" "$@" >>"$LOG_FILE" 2>&1
+LAUNCH_STATUS=$?
+if (( LAUNCH_STATUS != 0 )); then
+  show_error "程序未能正常启动或运行已中断（退出码 $LAUNCH_STATUS）。错误日志：$LOG_FILE"
+fi
+exit "$LAUNCH_STATUS"
