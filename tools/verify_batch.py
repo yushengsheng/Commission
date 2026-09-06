@@ -15,7 +15,7 @@ import sys
 import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from rebate_engine import Filters, load_csvs
+from rebate_engine import Filters, load_csvs, normalize_order_type
 
 SCALE = 10**18
 
@@ -64,7 +64,7 @@ def verify(paths, requested_ids=()):
                 assert len(row) == len(header)
                 uid = row[uid_col].strip()
                 day = date.fromisoformat(row[day_col].strip()[:10].replace("/", "-"))
-                order = row[order_col].strip() or "未标注" if order_col is not None else "未标注"
+                order = normalize_order_type(row[order_col] if order_col is not None else "")
                 value = units(row[money_col])
                 reference[day, uid, order][0] += 1
                 reference[day, uid, order][1] += value

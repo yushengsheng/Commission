@@ -40,6 +40,17 @@ def normalize_header(value: str) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value).lstrip("\ufeff")).lower()
 
 
+def normalize_order_type(value: str) -> str:
+    """Canonicalize known exchange labels without merging unknown business values."""
+    text = unicodedata.normalize("NFKC", value).strip()
+    if not text:
+        return "未标注"
+    return {
+        "spot": "spot",
+        "usdt-futures": "USDT-futures",
+    }.get(text.casefold(), text)
+
+
 def parse_ids(text: str) -> tuple[str, ...]:
     """Deduplicate FILTER IDs, never CSV records; preserve leading zeros."""
     items = [s for s in re.split(r"[\s,，;；、]+", text.strip()) if s]
@@ -154,6 +165,13 @@ class Dataset:
     order_types: tuple[str, ...]
     buckets: dict[tuple[date, str, str], Aggregate] = field(repr=False)
     sources: tuple[SourceSummary, ...] = ()
+    uid_bucket_keys: dict[str, list[tuple[date, str, str]]] = field(
+        init=False, repr=False, compare=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.uid_bucket_keys = {}
+        for key in self.buckets:
+            self.uid_bucket_keys.setdefault(key[1], []).append(key)
 
     def query(self, filters: Filters = Filters()) -> QueryResult:
         filters.validate()
@@ -165,9 +183,12 @@ class Dataset:
         lifetime_counts: dict[str, int] = {}
         with localcontext() as context:
             context.prec = MONEY_PRECISION
-            for (day, uid, order), values in self.buckets.items():
-                if wanted and uid not in wanted:
-                    continue
+            if wanted:
+                bucket_items = ((key, self.buckets[key]) for uid in wanted
+                                for key in self.uid_bucket_keys.get(uid, ()))
+            else:
+                bucket_items = self.buckets.items()
+            for (day, uid, order), values in bucket_items:
                 lifetime_counts[uid] = lifetime_counts.get(uid, 0) + values.count
                 if filters.start and day < filters.start:
                     continue
@@ -253,8 +274,7 @@ def load_csv(
                     amount = parse_money(row[positions[AMOUNT_COLUMN]])
                 except DataError as exc:
                     raise DataError(f"第 {reader.line_num} 行：{exc}") from exc
-                order = row[order_pos].strip() if order_pos is not None else "未标注"
-                order = order or "未标注"
+                order = normalize_order_type(row[order_pos] if order_pos is not None else "")
                 # NO row deduplication: identical records increment both total and count.
                 buckets.setdefault((day, uid, order), Aggregate()).add(amount)
                 file_total.add(amount)
@@ -335,7 +355,11 @@ def load_csvs(paths, progress=None, cancelled=None, encoding="utf-8-sig", file_s
                 for position, (key, value) in enumerate(part.buckets.items()):
                     if position % 2048 == 0 and cancelled and cancelled():
                         raise ImportCancelled()
-                    batch.buckets.setdefault(key, Aggregate()).add(value.total, value.count)
+                    target = batch.buckets.get(key)
+                    if target is None:
+                        target = batch.buckets[key] = Aggregate()
+                        batch.uid_bucket_keys.setdefault(key[1], []).append(key)
+                    target.add(value.total, value.count)
             batch.row_count += part.row_count
             batch.size_bytes += part.size_bytes
             batch.ids = batch.ids | part.ids

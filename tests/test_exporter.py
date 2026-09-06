@@ -4,8 +4,9 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from openpyxl import load_workbook
 
-from exporter import export_csv
+from exporter import EXPORT_HEADERS, export_csv, export_result, export_xlsx
 from rebate_engine import DataError, Filters, load_csv, load_csvs
 
 
@@ -30,8 +31,46 @@ def test_export_matches_exact_filtered_total(make_csv, tmp_path, view):
         assert all(row["UID状态"] == "" and row["全批次笔数"] == "" for row in rows)
 
 
+@pytest.mark.parametrize("view", ["id", "day", "daily_id"])
+def test_xlsx_export_preserves_exact_text_and_filtered_total(make_csv, tmp_path, view):
+    dataset = load_csv(make_csv())
+    result = dataset.query(Filters(("001", "2", "999"), date(2026, 8, 18), date(2026, 8, 24)))
+    path = tmp_path / f"out-{view}.xlsx"
+    count = export_xlsx(path, dataset, result, view)
+    workbook = load_workbook(path, data_only=False)
+    worksheet = workbook.active
+    values = list(worksheet.values)
+    assert list(values[0]) == EXPORT_HEADERS
+    rows = [dict(zip(EXPORT_HEADERS, row)) for row in values[1:]]
+    assert count == len(rows)
+    assert sum(Decimal(row["返佣收入(USDT)"]) for row in rows) == result.total
+    assert sum(int(row["返佣笔数"]) for row in rows) == result.count
+    assert worksheet.freeze_panes == "A2"
+    assert worksheet.auto_filter.ref == f"A1:N{count + 1}"
+    amount_column = EXPORT_HEADERS.index("返佣收入(USDT)") + 1
+    for row in range(2, count + 2):
+        assert worksheet.cell(row, amount_column).data_type == "s"
+        assert worksheet.cell(row, amount_column).number_format == "@"
+    if view != "day":
+        uid_column = EXPORT_HEADERS.index("好友ID（现货）") + 1
+        uid_cell = next(worksheet.cell(row, uid_column) for row in range(2, count + 2)
+                        if worksheet.cell(row, uid_column).value == "001")
+        assert uid_cell.data_type == "s" and uid_cell.number_format == "@"
+    workbook.close()
+
+
+def test_export_result_dispatches_and_rejects_unknown_suffix(make_csv, tmp_path):
+    dataset = load_csv(make_csv())
+    result = dataset.query()
+    assert export_result(tmp_path / "out.csv", dataset, result) == len(result.per_id)
+    assert export_result(tmp_path / "out.xlsx", dataset, result) == len(result.per_id)
+    with pytest.raises(DataError, match="CSV 或 XLSX"):
+        export_result(tmp_path / "out.txt", dataset, result)
+
+
+@pytest.mark.parametrize("writer", [export_csv, export_xlsx])
 @pytest.mark.parametrize("kind", ["original", "symlink", "hardlink"])
-def test_source_overwrite_protection(make_csv, tmp_path, kind):
+def test_source_overwrite_protection(make_csv, tmp_path, kind, writer):
     source = make_csv()
     original = source.read_bytes()
     target = source
@@ -43,21 +82,22 @@ def test_source_overwrite_protection(make_csv, tmp_path, kind):
             os.link(source, target)
     dataset = load_csv(source)
     with pytest.raises(DataError, match="覆盖源"):
-        export_csv(target, dataset, dataset.query())
+        writer(target, dataset, dataset.query())
     assert source.read_bytes() == original
 
 
-def test_failed_export_preserves_existing_file(make_csv, tmp_path, monkeypatch):
+@pytest.mark.parametrize("writer,suffix", [(export_csv, ".csv"), (export_xlsx, ".xlsx")])
+def test_failed_export_preserves_existing_file(make_csv, tmp_path, monkeypatch, writer, suffix):
     dataset = load_csv(make_csv())
-    target = tmp_path / "existing.csv"
+    target = tmp_path / f"existing{suffix}"
     target.write_text("existing", encoding="utf8")
     def fail(*args):
         raise OSError("test failure")
     monkeypatch.setattr("exporter.os.replace", fail)
     with pytest.raises(OSError):
-        export_csv(target, dataset, dataset.query())
+        writer(target, dataset, dataset.query())
     assert target.read_text() == "existing"
-    assert not list(tmp_path.glob(".rebate-export-*.tmp"))
+    assert not list(tmp_path.glob(".rebate-export-*"))
 
 
 def test_formula_injection_in_filename_is_escaped(make_csv, tmp_path):
@@ -67,6 +107,12 @@ def test_formula_injection_in_filename_is_escaped(make_csv, tmp_path):
     with target.open(encoding="utf-8-sig", newline="") as stream:
         row = next(csv.DictReader(stream))
     assert row["来源文件"].startswith("'=")
+    xlsx = tmp_path / "out.xlsx"
+    export_xlsx(xlsx, dataset, dataset.query())
+    workbook = load_workbook(xlsx, data_only=False)
+    source_cell = workbook.active.cell(2, 1)
+    assert source_cell.value.startswith("'=") and source_cell.data_type == "s"
+    workbook.close()
 
 
 def test_moved_source_export_still_works_and_source_stays_protected(make_csv, tmp_path):

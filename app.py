@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QSizePolicy, QTabWidget, QTableView, QVBoxLayout, QWidget,
 )
 
-from exporter import export_csv, validate_export_target
+from exporter import export_result, validate_export_target
 from rebate_engine import DataError, Dataset, Filters, QueryResult, STATUS_LABELS, format_money, parse_ids
 from worker import ImportWorker
 
@@ -745,13 +745,14 @@ class MainWindow(QMainWindow):
             return
         index = self.tabs.currentIndex()
         names = ("按好友", "按日期", "日期与好友")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出当前筛选结果", f"返佣汇总-{names[index]}.csv", "CSV 表格 (*.csv)",
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "导出当前筛选结果", f"返佣汇总-{names[index]}",
+            "CSV 表格 (*.csv);;Excel 工作簿 (*.xlsx)",
             options=QFileDialog.Option.DontConfirmOverwrite)
         if not path:
             return
-        if not path.lower().endswith(".csv"):
-            path += ".csv"
+        if Path(path).suffix.lower() not in (".csv", ".xlsx"):
+            path += ".xlsx" if "*.xlsx" in selected_filter else ".csv"
         # Confirm AFTER extension normalization, so choosing "out" cannot silently
         # overwrite an existing "out.csv" that the native picker did not check.
         try:
@@ -766,8 +767,8 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         try:
-            count = export_csv(path, self.dataset, self.result, ("id", "day", "daily_id")[index],
-                               self.status_filter.currentData(), self.uid_search.text())
+            count = export_result(path, self.dataset, self.result, ("id", "day", "daily_id")[index],
+                                  self.status_filter.currentData(), self.uid_search.text())
         except (OSError, DataError) as exc:
             self.show_error(str(exc))
             return

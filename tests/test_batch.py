@@ -19,6 +19,7 @@ def test_split_files_all_rows_add_and_sources_reconcile(make_csv):
     assert result.total == Decimal("0.617283945617283945")
     assert [source.row_count for source in dataset.sources] == [2, 3]
     assert dataset.sources[0].total == Decimal("0.246913578246913578")
+    assert dataset.uid_bucket_keys == {"001": [(date(2026, 8, 18), "001", "spot")]}
     assert load_csvs([b, a]).query().total == result.total
 
 

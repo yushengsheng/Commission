@@ -82,6 +82,24 @@ def test_order_filter_does_not_default_to_spot(make_csv):
     assert dataset.query(Filters(order_type="spot")).count == 7
 
 
+def test_known_order_types_are_case_normalized_but_unknown_values_are_preserved(make_csv):
+    rows = [
+        ["spot", "1", "0", "1", "2026-08-18"],
+        [" Spot ", "1", "0", "2", "2026-08-18"],
+        ["SPOT", "1", "0", "4", "2026-08-18"],
+        ["USDT-Futures", "1", "0", "8", "2026-08-18"],
+        ["usdt-futures", "1", "0", "16", "2026-08-18"],
+        ["Margin", "1", "0", "32", "2026-08-18"],
+        ["margin", "1", "0", "64", "2026-08-18"],
+    ]
+    dataset = load_csv(make_csv(rows))
+    assert dataset.order_types == ("Margin", "USDT-futures", "margin", "spot")
+    assert dataset.query(Filters(order_type="spot")).total == 7
+    assert dataset.query(Filters(order_type="USDT-futures")).total == 24
+    assert dataset.query(Filters(order_type="Margin")).total == 32
+    assert dataset.query(Filters(order_type="margin")).total == 64
+
+
 def test_reversed_range(make_csv):
     with pytest.raises(DataError, match="开始日期"):
         load_csv(make_csv()).query(Filters(start=date(2026, 8, 25), end=date(2026, 8, 18)))

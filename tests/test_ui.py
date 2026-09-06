@@ -3,6 +3,7 @@ from decimal import Decimal
 import time
 
 import pytest
+from openpyxl import load_workbook
 from PySide6.QtCore import QDate, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
@@ -168,6 +169,29 @@ def test_export_button_uses_current_tab_and_filters(window, make_csv, tmp_path, 
     assert "3.65000000" not in text
 
 
+def test_ui_can_export_xlsx_with_filter_selected_extension(window, make_csv, tmp_path, qapp, monkeypatch):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    window.id_input.setPlainText("001")
+    window.calculate()
+    target_without_suffix = tmp_path / "exact-export"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (
+        str(target_without_suffix), "Excel 工作簿 (*.xlsx)"))
+    window.export_button.click()
+    target = target_without_suffix.with_suffix(".xlsx")
+    assert target.exists()
+    workbook = load_workbook(target, data_only=False)
+    worksheet = workbook.active
+    headers = [cell.value for cell in worksheet[1]]
+    uid_column = headers.index("好友ID（现货）") + 1
+    amount_column = headers.index("返佣收入(USDT)") + 1
+    assert worksheet.cell(2, uid_column).value == "001"
+    assert worksheet.cell(2, uid_column).data_type == "s"
+    assert worksheet.cell(2, amount_column).value == "0.20000000"
+    assert worksheet.cell(2, amount_column).data_type == "s"
+    workbook.close()
+
+
 def test_table_sorts_amount_numerically(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)
@@ -318,6 +342,26 @@ def test_missing_previous_order_does_not_silently_broaden_filter(window, make_cs
     assert window.order_combo.currentData() == "USDT-futures"
     assert window.result.total == 0
     assert window.result.statuses == {"1": "inactive"}
+
+
+def test_known_order_type_variants_share_one_ui_filter(window, make_csv, qapp):
+    rows = [
+        ["Spot", "1", "0", "1", "2026-08-18"],
+        ["SPOT", "1", "0", "2", "2026-08-18"],
+        ["USDT-Futures", "1", "0", "4", "2026-08-18"],
+        ["usdt-futures", "1", "0", "8", "2026-08-18"],
+    ]
+    window.import_file(str(make_csv(rows)))
+    wait_idle(window, qapp)
+    assert [window.order_combo.itemData(i) for i in range(window.order_combo.count())] == [
+        None, "USDT-futures", "spot"
+    ]
+    window.order_combo.setCurrentIndex(window.order_combo.findData("spot"))
+    window.calculate()
+    assert window.result.total == 3
+    window.order_combo.setCurrentIndex(window.order_combo.findData("USDT-futures"))
+    window.calculate()
+    assert window.result.total == 12
 
 
 def test_missing_ids_have_complete_red_record_and_copy(window, make_csv, qapp):
