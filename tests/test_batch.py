@@ -112,3 +112,12 @@ def test_uid_statuses_include_missing_inactive_zero_negative_positive(make_csv):
 def test_empty_batch_rejected():
     with pytest.raises(DataError, match="至少"):
         load_csvs([])
+
+
+def test_independent_verifier_accepts_header_only_csv(make_csv):
+    from tools.verify_batch import verify
+    report = verify([make_csv([])])
+    assert report["records"] == 0
+    assert Decimal(report["usdt"]) == 0
+    assert report["exact_bucket_reconciliation"] == "PASS"
+    assert report["independent_queries"] == 40

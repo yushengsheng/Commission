@@ -192,6 +192,23 @@ def test_ui_can_export_xlsx_with_filter_selected_extension(window, make_csv, tmp
     workbook.close()
 
 
+def test_excel_validation_error_is_visible_and_keeps_result(window, make_csv, tmp_path, qapp, monkeypatch):
+    target = tmp_path / "invalid.xlsx"
+    # An unknown order label is legal CSV input but may be invalid Excel text.
+    path = make_csv([["custom\x01type", "001", "0", "1", "2026-08-18"]], filename="special.csv")
+    window.import_file(str(path))
+    wait_idle(window, qapp)
+    window.order_combo.setCurrentIndex(window.order_combo.findData("custom\x01type"))
+    window.calculate()
+    total = window.result.total
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), "Excel 工作簿 (*.xlsx)"))
+    window.export_current()
+    assert "字符" in window.last_error and "CSV" in window.last_error
+    assert window.warning_label.isVisible()
+    assert window.result.total == total
+    assert not target.exists()
+
+
 def test_table_sorts_amount_numerically(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)

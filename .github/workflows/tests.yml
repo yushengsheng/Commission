@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS startup and regression tests
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+      - name: Install runtime dependencies in a fresh environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -m pip check
+      - name: Verify startup with only runtime dependencies
+        run: |
+          ./启动返佣结算.command --check
+          ./返佣结算.app/Contents/MacOS/返佣结算 --check
+      - name: Install test dependencies
+        run: |
+          .venv/bin/python -m pip install -r requirements-dev.txt
+          .venv/bin/python -m pip check
+      - name: Run regression tests
+        run: .venv/bin/python -m pytest -q
+      - name: Check launcher syntax and bundle metadata
+        run: |
+          /bin/zsh -n 启动返佣结算.command
+          /bin/zsh -n 返佣结算.app/Contents/MacOS/返佣结算
+          /usr/bin/plutil -lint 返佣结算.app/Contents/Info.plist
+          git diff --exit-code

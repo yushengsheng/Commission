@@ -1,5 +1,7 @@
 import csv
 import os
+import subprocess
+import sys
 from datetime import date
 from decimal import Decimal
 
@@ -165,3 +167,101 @@ def test_status_export_contains_complete_inactive_missing_and_zero(make_csv, tmp
         rows = list(csv.DictReader(stream))
     assert len(rows) == 1 and rows[0]["所选文件中存在"] == "否"
     assert rows[0]["好友ID（现货）"] == "999"
+
+
+def test_missing_excel_dependency_does_not_disable_app_or_csv(make_csv, tmp_path):
+    code = """
+import builtins
+original_import = builtins.__import__
+def without_excel(name, *args, **kwargs):
+    if name == 'openpyxl' or name.startswith('openpyxl.'):
+        raise ModuleNotFoundError("No module named 'openpyxl'", name='openpyxl')
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = without_excel
+import sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+from app import MainWindow
+from exporter import export_csv, export_xlsx
+from rebate_engine import DataError, load_csv
+application = QApplication([])
+window = MainWindow()
+window.show()
+application.processEvents()
+assert window.isVisible()
+dataset = load_csv(sys.argv[1])
+assert export_csv(sys.argv[2], dataset, dataset.query()) == 6
+try:
+    export_xlsx(sys.argv[3], dataset, dataset.query())
+except DataError as exc:
+    assert 'pip install -r requirements.txt' in str(exc)
+else:
+    raise AssertionError('Missing Excel dependency was not reported')
+assert not Path(sys.argv[3]).exists()
+window.close()
+"""
+    result = subprocess.run([sys.executable, "-c", code, str(make_csv()),
+                             str(tmp_path / "out.csv"), str(tmp_path / "out.xlsx")],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("order", ["custom\x01type", "custom\ufffetype"])
+def test_invalid_excel_text_fails_cleanly_and_preserves_existing_file(make_csv, tmp_path, order):
+    from openpyxl.worksheet._writer import ALL_TEMP_FILES
+    dataset = load_csv(make_csv([[order, "1", "0", "1", "2026-08-18"]]))
+    target = tmp_path / "existing.xlsx"
+    target.write_bytes(b"keep existing export")
+    temp_files_before = set(ALL_TEMP_FILES)
+    with pytest.raises(DataError, match="字符.*CSV"):
+        export_xlsx(target, dataset, dataset.query(Filters(order_type=order)))
+    assert target.read_bytes() == b"keep existing export"
+    assert set(ALL_TEMP_FILES) == temp_files_before
+    assert not list(tmp_path.glob(".rebate-export-*"))
+
+
+def test_excel_long_filter_list_is_not_silently_truncated(make_csv, tmp_path):
+    dataset = load_csv(make_csv())
+    ids = tuple(str(100000000000000000 + i) for i in range(1800))
+    target = tmp_path / "too-long.xlsx"
+    with pytest.raises(DataError, match="32767.*CSV"):
+        export_xlsx(target, dataset, dataset.query(Filters(ids)))
+    assert not target.exists()
+
+
+def test_excel_error_like_label_is_exported_as_literal_text(make_csv, tmp_path):
+    dataset = load_csv(make_csv([["#N/A", "001", "0", "1", "2026-08-18"]]))
+    target = tmp_path / "literal.xlsx"
+    export_xlsx(target, dataset, dataset.query(Filters(order_type="#N/A")))
+    workbook = load_workbook(target)
+    cell = workbook.active.cell(2, 4)
+    assert cell.value == "#N/A"
+    assert cell.data_type == "s"
+    workbook.close()
+
+
+def test_excel_row_limit_includes_header(make_csv, tmp_path, monkeypatch):
+    dataset = load_csv(make_csv())
+    # Use a small limit to exercise both sides without constructing a million rows.
+    monkeypatch.setattr("exporter.XLSX_MAX_ROWS", 6)
+    with pytest.raises(DataError, match="含表头.*CSV"):
+        export_xlsx(tmp_path / "overflow.xlsx", dataset, dataset.query())
+    monkeypatch.setattr("exporter.XLSX_MAX_ROWS", 7)
+    assert export_xlsx(tmp_path / "fits.xlsx", dataset, dataset.query()) == 6
+
+
+def test_failed_workbook_save_cleans_worksheet_and_target_temporary_files(make_csv, tmp_path, monkeypatch):
+    from openpyxl import Workbook
+    from openpyxl.worksheet._writer import ALL_TEMP_FILES
+    dataset = load_csv(make_csv())
+    target = tmp_path / "existing.xlsx"
+    target.write_bytes(b"previous export")
+    temp_files_before = set(ALL_TEMP_FILES)
+    def fail(*args):
+        raise OSError("simulated disk full")
+    monkeypatch.setattr(Workbook, "save", fail)
+    with pytest.raises(OSError, match="disk full"):
+        export_xlsx(target, dataset, dataset.query())
+    assert target.read_bytes() == b"previous export"
+    assert set(ALL_TEMP_FILES) == temp_files_before
+    assert not list(tmp_path.glob(".rebate-export-*"))

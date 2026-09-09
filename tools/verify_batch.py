@@ -91,9 +91,9 @@ def verify(paths, requested_ids=()):
     days = sorted({key[0] for key in reference})
     for index in range(40):
         selected = tuple(rng.sample(ids, min(len(ids), 20)) + ["99999999999999999999999999"]) if index % 2 else ()
-        start, end = sorted(rng.choices(days, k=2))
+        start, end = sorted(rng.choices(days, k=2)) if days else (None, None)
         f = Filters(selected, start if index % 3 else None, end if index % 4 else None,
-                    rng.choice(dataset.order_types) if index % 5 else None)
+                    rng.choice(dataset.order_types) if index % 5 and dataset.order_types else None)
         queried = dataset.query(f)
         expected = defaultdict(lambda: [0, 0])
         for (day, uid, order), (count, amount) in reference.items():

@@ -3,13 +3,10 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import tempfile
+from contextlib import suppress
 from pathlib import Path
-
-from openpyxl import Workbook
-from openpyxl.cell import WriteOnlyCell
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 from rebate_engine import DataError, Dataset, QueryResult, STATUS_LABELS, format_money
 
@@ -20,6 +17,9 @@ EXPORT_HEADERS = [
 ]
 TEXT_COLUMNS = frozenset({0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13})
 VIEW_TITLES = {"id": "按好友", "day": "按日期", "daily_id": "日期与好友"}
+XLSX_MAX_ROWS = 1_048_576
+XLSX_MAX_CELL_LENGTH = 32_767
+INVALID_XML_TEXT = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def safe_cell(value: str) -> str:
@@ -70,13 +70,13 @@ def _records(dataset: Dataset, result: QueryResult, view: str, status: str, sear
                 ("否" if uid_status == "missing" else "是") if uid_status else "",
                 STATUS_LABELS.get(uid_status, ""), result.lifetime_counts.get(uid, 0) if uid_status else "",
                 safe_cell(status) if view == "id" else "", safe_cell(search) if view == "id" else ""]
-    return len(rows), iterate()
+    return len(rows), iterate
 
 
 def export_csv(path: str | Path, dataset: Dataset, result: QueryResult, view="id",
                status="", search="") -> int:
     target = validate_export_target(path, dataset)
-    count, records = _records(dataset, result, view, status, search)
+    count, iter_records = _records(dataset, result, view, status, search)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", newline="", dir=target.parent,
@@ -84,7 +84,7 @@ def export_csv(path: str | Path, dataset: Dataset, result: QueryResult, view="id
             temp_path = Path(stream.name)
             writer = csv.writer(stream)
             writer.writerow(EXPORT_HEADERS)
-            writer.writerows(records)
+            writer.writerows(iter_records())
             stream.flush()
             os.fsync(stream.fileno())
         validate_export_target(target, dataset)
@@ -96,37 +96,60 @@ def export_csv(path: str | Path, dataset: Dataset, result: QueryResult, view="id
     return count
 
 
-def _xlsx_cell(worksheet, value, column: int, header: bool = False):
-    cell = WriteOnlyCell(worksheet, value=value)
-    if header:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="237E64")
-    elif column in TEXT_COLUMNS:
-        # UID and exact Decimal text must never be coerced to Excel's 15-digit numeric type.
-        cell.number_format = "@"
-    return cell
-
-
 def export_xlsx(path: str | Path, dataset: Dataset, result: QueryResult, view="id",
                 status="", search="") -> int:
     target = validate_export_target(path, dataset)
-    count, records = _records(dataset, result, view, status, search)
+    # Excel support must not prevent launching the app or using the CSV workflow.
+    try:
+        from openpyxl import Workbook
+        from openpyxl.cell import WriteOnlyCell
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:
+        raise DataError("Excel 导出依赖缺失或损坏。请在项目目录执行："
+                        ".venv/bin/python -m pip install -r requirements.txt；也可先导出 CSV。") from exc
+    count, iter_records = _records(dataset, result, view, status, search)
+    if count + 1 > XLSX_MAX_ROWS:
+        raise DataError(f"Excel 单表最多 {XLSX_MAX_ROWS} 行（含表头），请缩小筛选范围或导出 CSV。")
+    # Validate before openpyxl can truncate cells or create a partial worksheet.
+    for record in iter_records():
+        for column, value in enumerate(record):
+            if not isinstance(value, str):
+                continue
+            if len(value) > XLSX_MAX_CELL_LENGTH:
+                raise DataError(f"“{EXPORT_HEADERS[column]}”超过 Excel 单元格 {XLSX_MAX_CELL_LENGTH} 字符限制，"
+                                "请缩小筛选范围或导出 CSV 以保留完整内容。")
+            if INVALID_XML_TEXT.search(value):
+                raise DataError(f"“{EXPORT_HEADERS[column]}”含 Excel 不支持的字符，请导出 CSV 以保留原值。")
     workbook = Workbook(write_only=True)
     worksheet = workbook.create_sheet(VIEW_TITLES[view])
-    worksheet.freeze_panes = "A2"
-    widths = (28, 13, 13, 18, 28, 20, 13, 12, 24, 16, 24, 14, 18, 20)
-    for column, width in enumerate(widths, 1):
-        worksheet.column_dimensions[get_column_letter(column)].width = width
-    worksheet.append([_xlsx_cell(worksheet, value, column, header=True)
-                      for column, value in enumerate(EXPORT_HEADERS)])
-    for record in records:
-        worksheet.append([_xlsx_cell(worksheet, value, column)
-                          for column, value in enumerate(record)])
-    worksheet.auto_filter.ref = f"A1:{get_column_letter(len(EXPORT_HEADERS))}{count + 1}"
-    workbook.properties.title = f"返佣汇总-{VIEW_TITLES[view]}"
-    workbook.properties.creator = "返佣结算"
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="237E64")
+
+    def make_cell(value, column, header=False):
+        cell = WriteOnlyCell(worksheet, value=value)
+        if isinstance(value, str):
+            # Formatting alone does not stop labels such as '#N/A' becoming errors.
+            cell.data_type = "s"
+        if header:
+            cell.font, cell.fill = header_font, header_fill
+        elif column in TEXT_COLUMNS:
+            cell.number_format = "@"
+        return cell
+
     temp_path = None
     try:
+        worksheet.freeze_panes = "A2"
+        widths = (28, 13, 13, 18, 28, 20, 13, 12, 24, 16, 24, 14, 18, 20)
+        for column, width in enumerate(widths, 1):
+            worksheet.column_dimensions[get_column_letter(column)].width = width
+        worksheet.append([make_cell(value, column, header=True)
+                          for column, value in enumerate(EXPORT_HEADERS)])
+        for record in iter_records():
+            worksheet.append([make_cell(value, column) for column, value in enumerate(record)])
+        worksheet.auto_filter.ref = f"A1:{get_column_letter(len(EXPORT_HEADERS))}{count + 1}"
+        workbook.properties.title = f"返佣汇总-{VIEW_TITLES[view]}"
+        workbook.properties.creator = "返佣结算"
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".rebate-export-",
                                          suffix=".xlsx", delete=False) as stream:
             temp_path = Path(stream.name)
@@ -137,9 +160,22 @@ def export_xlsx(path: str | Path, dataset: Dataset, result: QueryResult, view="i
         os.replace(temp_path, target)
         temp_path = None
     finally:
-        workbook.close()
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+        # Workbook.close() alone does not remove write-only worksheet temp files
+        # when saving fails. Close the XML stream before removing that owned file.
+        try:
+            writer = worksheet._writer
+            if writer is not None:
+                if not worksheet.closed:
+                    with suppress(OSError, ValueError):
+                        worksheet.close()
+                with suppress(OSError, ValueError):
+                    writer.close()
+                if os.path.exists(writer.out):
+                    writer.cleanup()
+        finally:
+            workbook.close()
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
     return count
 
 

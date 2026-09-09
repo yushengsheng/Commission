@@ -1,9 +1,15 @@
 #!/bin/zsh
-set -eu
+set -u
+umask 077
 PROJECT_DIR="${0:A:h:h:h:h}"
+CHECK_ONLY="${1:-}"
 
 show_error() {
   print -u2 -r -- "$1"
+  # --check is non-interactive, including on failure.
+  if [[ "$CHECK_ONLY" == "--check" ]]; then
+    return
+  fi
   /usr/bin/osascript - "$1" <<'APPLESCRIPT'
 on run argv
     display alert "返佣结算启动失败" message (item 1 of argv) as critical buttons {"好"} default button "好"
@@ -11,50 +17,45 @@ end run
 APPLESCRIPT
 }
 
-cd -- "$PROJECT_DIR" || exit 1
+cd -- "$PROJECT_DIR" || {
+  show_error "无法访问项目文件夹：$PROJECT_DIR。请检查文件夹访问权限。"
+  exit 1
+}
 
-# 自动化环境检查支持
-if [[ "${1:-}" == "--check" ]]; then
-  exec "$PROJECT_DIR/.venv/bin/python" -c 'import app, rebate_engine, exporter, worker; print("返佣结算启动环境正常")'
+if [[ ! -f "$PROJECT_DIR/app.py" ]]; then
+  show_error "找不到 app.py。请将‘返佣结算.app’放回项目文件夹，不要单独移走 App。"
+  exit 1
 fi
 
-# 确定运行目录
-# 若当前处于受限的 Downloads 目录，优先使用 ~/.local/share/Commission 运行，彻底规避 TCC 限制
-RUNTIME_DIR="$PROJECT_DIR"
-if [[ "$PROJECT_DIR" == "$HOME/Downloads"* ]]; then
-  TARGET_DIR="$HOME/.local/share/Commission"
-  mkdir -p "$TARGET_DIR" 2>/dev/null || true
-  # 同步最新代码至本地运行目录（排除虚拟环境）
-  rsync -a --update \
-    --exclude ".git" \
-    --exclude "artifacts" \
-    --exclude ".venv" \
-    --exclude "__pycache__" \
-    --exclude ".pytest_cache" \
-    "$PROJECT_DIR/" "$TARGET_DIR/" 2>/dev/null || true
+if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+  show_error "缺少 Python 运行环境。请在项目目录执行：
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt"
+  exit 1
+fi
 
-  # 若目标目录尚无虚拟环境，复制或链接已有环境
-  if [[ ! -x "$TARGET_DIR/.venv/bin/python" && -d "$PROJECT_DIR/.venv" ]]; then
-    cp -R "$PROJECT_DIR/.venv" "$TARGET_DIR/.venv" 2>/dev/null || true
+if [[ "$CHECK_ONLY" == "--check" ]]; then
+  if "$PROJECT_DIR/.venv/bin/python" -c 'import app, rebate_engine, exporter, worker, openpyxl; print("返佣结算启动环境正常")'; then
+    exit 0
   fi
-  RUNTIME_DIR="$TARGET_DIR"
-fi
-
-if [[ ! -f "$RUNTIME_DIR/app.py" ]]; then
-  show_error "找不到 app.py 文件。"
+  show_error "启动环境检查失败，请根据上面的错误修复。在项目目录同步依赖：
+.venv/bin/python -m pip install -r requirements.txt"
   exit 1
 fi
 
-if [[ ! -x "$RUNTIME_DIR/.venv/bin/python" ]]; then
-  show_error "缺少 Python 运行环境。请按照项目 README.md 的启动说明恢复 .venv 环境。"
-  exit 1
-fi
-
-LOG_DIR="$RUNTIME_DIR/artifacts"
-mkdir -p -- "$LOG_DIR" 2>/dev/null || true
+LOG_DIR="$PROJECT_DIR/artifacts"
 LOG_FILE="$LOG_DIR/launcher.log"
+if ! mkdir -p -- "$LOG_DIR" || ! touch -- "$LOG_FILE"; then
+  show_error "无法写入启动日志：$LOG_FILE。请检查项目文件夹的写入及访问权限。"
+  exit 1
+fi
 
-cd -- "$RUNTIME_DIR" || exit 1
-
-# 纯原生启动 Python GUI 进程，完全不打开任何终端窗口
-exec "$RUNTIME_DIR/.venv/bin/python" -u "$RUNTIME_DIR/app.py" "$@" >>"$LOG_FILE" 2>&1
+# Wait for Python so crashes can be reported; Finder still opens no Terminal.
+"$PROJECT_DIR/.venv/bin/python" -u "$PROJECT_DIR/app.py" "$@" >>"$LOG_FILE" 2>&1
+LAUNCH_STATUS=$?
+if (( LAUNCH_STATUS != 0 )); then
+  show_error "程序启动或运行失败（退出码 $LAUNCH_STATUS）。错误日志：$LOG_FILE
+若刚更新过代码，请在项目目录同步依赖：
+.venv/bin/python -m pip install -r requirements.txt"
+fi
+exit "$LAUNCH_STATUS"
