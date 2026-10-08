@@ -5,7 +5,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from PySide6.QtCore import QDate, QTimer
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtWidgets import QApplication
 from app import MainWindow, STYLE
 
@@ -33,7 +33,7 @@ def main():
                 writer.writerow([str(10010000 + uid), "1", "2026-08-17", "spot"])
             writer.writerow(["10010026", "0E-8", "2026-08-20", "spot"])
             writer.writerow(["10010027", "-0.10", "2026-08-20", "spot"])
-        window = MainWindow()
+        window = MainWindow(settings=QSettings(str(Path(folder) / "preview.ini"), QSettings.Format.IniFormat))
         window.show()
         window.import_files([str(path), str(second)])
         monitor = QTimer()
@@ -46,10 +46,8 @@ def main():
                 print("PREVIEW FAILED", window.last_error)
                 application.exit(1)
                 return
-            window.start_date.setDate(QDate(2026, 8, 18))
-            window.end_date.setDate(QDate(2026, 8, 24))
-            window.start_check.setChecked(True)
-            window.end_check.setChecked(True)
+            window.start_date.setText("2026-08-18")
+            window.end_date.setText("2026-08-24")
             window.id_input.setPlainText("\n".join(str(10010000 + uid) for uid in range(30)))
             window.calculate()
             def capture():
@@ -63,6 +61,19 @@ def main():
                 assert window.grab().save(str(output / "ui-missing.png"))
                 assert window.models[0].rowCount() == 2
                 assert window.result.count == 464
+                window.end_date.setText("2026-08-23")
+                application.processEvents()
+                assert window.result.count == 464 and not window.export_button.isEnabled()
+                assert window.grab().save(str(output / "ui-pending.png"))
+                window.id_input.setPlainText("\n".join(str(10010000 + uid) for uid in range(28)))
+                window.end_date.setText("2026-08-24")
+                window.calculate()
+                application.processEvents()
+                assert window.grab().save(str(output / "ui-summary.png"))
+                window.audit_label.linkActivated.emit("inactive")
+                application.processEvents()
+                assert len(window.models[0].rows) == 6
+                assert window.grab().save(str(output / "ui-summary-filtered.png"))
                 print("GUI preview saved; synthetic data only")
                 window.close()
                 application.quit()

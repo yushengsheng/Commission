@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
+import re
 import sys
+import tempfile
 from collections import Counter
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, Qt, QTimer, Signal
+from PySide6.QtCore import QAbstractTableModel, QLockFile, QModelIndex, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QFileDialog, QFrame, QHBoxLayout,
+    QApplication, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QScrollArea, QSizePolicy, QTabWidget, QTableView, QVBoxLayout, QWidget,
 )
@@ -53,12 +59,9 @@ QPushButton#primary:hover { background: #1b6b54; }
 QPushButton#primary:disabled { background: #bdd7cd; border-color: #bdd7cd; color: #f4faf7; }
 QPushButton#copy { background: #204e4c; color: #d7ede6; border-color: #3c6661; padding: 7px 12px; }
 QPushButton#copy:disabled { color: #628c82; }
-QPlainTextEdit, QDateEdit, QComboBox, QLineEdit { background: #fbfcfc; border: 1px solid #d9e2df; border-radius: 7px; padding: 6px; selection-background-color: #298b6e; }
-QPlainTextEdit:focus, QDateEdit:focus, QComboBox:focus, QLineEdit:focus { border-color: #27866a; }
-QDateEdit:disabled { background: #f0f3f2; color: #a0afa9; }
-QDateEdit::drop-down, QComboBox::drop-down { border: none; width: 23px; }
-QCheckBox { spacing: 6px; font-size: 12px; }
-QCheckBox::indicator { width: 15px; height: 15px; }
+QPlainTextEdit, QComboBox, QLineEdit { background: #fbfcfc; border: 1px solid #d9e2df; border-radius: 7px; padding: 6px; selection-background-color: #298b6e; }
+QPlainTextEdit:focus, QComboBox:focus, QLineEdit:focus { border-color: #27866a; }
+QComboBox::drop-down { border: none; width: 23px; }
 QTabWidget::pane { border: none; background: white; }
 QTabBar::tab { background: white; color: #7d908a; padding: 7px 11px; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { color: #217e64; border-bottom: 2px solid #217e64; font-weight: 650; }
@@ -82,6 +85,44 @@ def label(text="", name=None, wrap=False):
         widget.setObjectName(name)
     widget.setWordWrap(wrap)
     return widget
+
+
+def parse_filter_date(value: str, name: str) -> date | None:
+    value = value.strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        raise DataError(f"{name}请输入 YYYY-MM-DD，例如 2026-08-18")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise DataError(f"{name}不是有效日期") from exc
+
+
+class DateInput(QLineEdit):
+    """Insert separators while typing digits; keep invalid pasted input visible for validation."""
+
+    def __init__(self):
+        super().__init__()
+        self.setPlaceholderText("YYYY-MM-DD")
+        self.textEdited.connect(self._format_digits)
+
+    def _format_digits(self, text):
+        if not re.fullmatch(r"[0-9-]*", text):
+            return
+        digits = text.replace("-", "")
+        if len(digits) > 8:
+            return
+        formatted = digits[:4]
+        if len(digits) > 4:
+            formatted += "-" + digits[4:6]
+        if len(digits) > 6:
+            formatted += "-" + digits[6:]
+        if formatted != text:
+            count_before_cursor = sum(char.isdigit() for char in text[:self.cursorPosition()])
+            self.setText(formatted)
+            offset = (count_before_cursor >= 4 and len(digits) > 4) + (count_before_cursor >= 6 and len(digits) > 6)
+            self.setCursorPosition(count_before_cursor + offset)
 
 
 def panel(name="panel", margins=20):
@@ -206,10 +247,13 @@ class SummaryModel(QAbstractTableModel):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
+        self.settings = settings if settings is not None else QSettings("local.rebate.settlement", "rebate-settlement")
         self.dataset: Dataset | None = None
         self.result: QueryResult | None = None
+        self.pending_filters = False
+        self.applied_scope = ""
         self.worker: ImportWorker | None = None
         self.cancel_requested = False
         self.close_requested = False
@@ -289,24 +333,15 @@ class MainWindow(QMainWindow):
         filters_layout.setSpacing(7)
         settings.addWidget(self.filters_widget)
         filters_layout.addWidget(label("日期与好友", "section"))
-        filters_layout.addWidget(label("返佣日期 · 包含起止日全天", "muted"))
-        self.start_check = QCheckBox("开始日期")
-        self.end_check = QCheckBox("结束日期")
-        self.start_date = QDateEdit(QDate.currentDate())
-        self.end_date = QDateEdit(QDate.currentDate())
+        filters_layout.addWidget(label("只输入年月日数字 · 横线自动补 · 留空不限", "muted"))
+        self.start_date = DateInput()
+        self.end_date = DateInput()
         for box in (self.start_date, self.end_date):
-            box.setDisplayFormat("yyyy-MM-dd")
-            box.setCalendarPopup(True)
-            box.setEnabled(False)
-            box.dateChanged.connect(self.filters_changed)
-        self.start_check.toggled.connect(self.start_date.setEnabled)
-        self.end_check.toggled.connect(self.end_date.setEnabled)
-        self.start_check.toggled.connect(self.filters_changed)
-        self.end_check.toggled.connect(self.filters_changed)
+            box.textChanged.connect(self.filters_changed)
         dates = QHBoxLayout()
-        for check, date_edit in ((self.start_check, self.start_date), (self.end_check, self.end_date)):
+        for title, date_edit in (("开始日期", self.start_date), ("结束日期", self.end_date)):
             col = QVBoxLayout()
-            col.addWidget(check)
+            col.addWidget(label(title))
             col.addWidget(date_edit)
             dates.addLayout(col)
         filters_layout.addLayout(dates)
@@ -367,11 +402,21 @@ class MainWindow(QMainWindow):
         self.days_label = self.add_metric(metrics, "有记录的日期", "—")
         right.addLayout(metrics)
         self.audit_label = label("UID 核对 · 导入后显示完整结果", "audit", True)
+        self.audit_label.setTextFormat(Qt.TextFormat.RichText)
+        self.audit_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse |
+                                                 Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.audit_label.setToolTip("点击数字筛选下方 UID；再次点击同一项恢复全部")
+        self.audit_label.linkActivated.connect(self.toggle_summary_filter)
         right.addWidget(self.audit_label)
         self.missing_panel, missing_layout = panel("missingPanel", 8)
         missing_layout.setSpacing(4)
         missing_header = QHBoxLayout()
         self.missing_label = label("", "missingTitle")
+        self.missing_label.setTextFormat(Qt.TextFormat.RichText)
+        self.missing_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse |
+                                                   Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.missing_label.setToolTip("点击状态数字筛选下方 UID；再次点击同一项恢复全部")
+        self.missing_label.linkActivated.connect(self.toggle_summary_filter)
         missing_header.addWidget(self.missing_label, 1)
         self.copy_missing_button = QPushButton("复制名单")
         self.copy_missing_button.clicked.connect(self.copy_missing_ids)
@@ -470,6 +515,8 @@ class MainWindow(QMainWindow):
 
     def invalidate_result(self, caption="条件已更改，请点击“统计返佣”更新结果"):
         self.result = None
+        self.pending_filters = False
+        self.applied_scope = ""
         self.copy_ids_button.setEnabled(False)
         for model in self.models:
             model.set_rows([])
@@ -496,26 +543,57 @@ class MainWindow(QMainWindow):
             self.id_hint.setText(f"已识别 {len(ids)} 个不同 ID" if ids else "未限定 ID · 统计所有好友")
         except DataError as exc:
             self.id_hint.setText(str(exc))
-        self.invalidate_result("条件已更改，请点击“统计返佣”更新结果" if self.dataset else "导入 CSV 后即可开始统计")
+        if self.dataset is None:
+            return
+        self.pending_filters = True
+        if self.result is not None:
+            self.scope_label.setText(self.applied_scope + "\n条件已修改 · 当前仍显示上次统计结果")
+        else:
+            self.scope_label.setText("条件已修改 · 点击“统计返佣”生成结果")
+        self.copy_button.setEnabled(False)
+        self.copy_ids_button.setEnabled(False)
+        self.copy_missing_button.setEnabled(False)
+        self.show_missing_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.warning_label.clear()
+        self.warning_label.hide()
+        self.statusBar().showMessage("条件已修改 · 当前显示上次结果，点击“统计返佣”更新")
 
     def get_filters(self):
         return Filters(parse_ids(self.id_input.toPlainText()),
-                       self.start_date.date().toPython() if self.start_check.isChecked() else None,
-                       self.end_date.date().toPython() if self.end_check.isChecked() else None,
+                       parse_filter_date(self.start_date.text(), "开始日期"),
+                       parse_filter_date(self.end_date.text(), "结束日期"),
                        self.order_combo.currentData())
 
     def reset_filters(self):
-        self.start_check.setChecked(False)
-        self.end_check.setChecked(False)
+        self.start_date.clear()
+        self.end_date.clear()
         self.id_input.clear()
         self.order_combo.setCurrentIndex(0)
-        if self.dataset:
-            self.calculate()
 
     def choose_file(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "选择返佣 CSV（可多选）", str(Path.home()), "CSV 表格 (*.csv *.CSV)")
+        folder = Path(str(self.settings.value("last_directory", str(Path.home()))))
+        if not folder.is_dir():
+            folder = Path.home()
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择返佣 CSV（可多选）", str(folder), "CSV 表格 (*.csv *.CSV)")
         if paths:
+            self.settings.setValue("last_directory", str(Path(paths[0]).expanduser().resolve().parent))
+            self.settings.sync()
             self.import_files(paths)
+
+    def restore_last_files(self):
+        saved = self.settings.value("last_files", [])
+        paths = [saved] if isinstance(saved, str) else saved
+        if not paths:
+            return
+        paths = [Path(path) for path in paths]
+        if not all(path.is_file() for path in paths):
+            self.show_error("上次导入的 CSV 已移动或删除，请重新选择文件")
+            return
+        index = self.encoding_combo.findData(self.settings.value("last_encoding", "utf-8-sig"))
+        if index >= 0:
+            self.encoding_combo.setCurrentIndex(index)
+        self.import_files(paths)
 
     def import_file(self, path):
         self.import_files([path])
@@ -573,14 +651,8 @@ class MainWindow(QMainWindow):
             self.import_cancelled()
             return
         self.dataset = dataset
-        self.file_label.setText(f"{len(dataset.sources)} 个 CSV · {dataset.size_bytes / 1_000_000:.1f} MB\n共 {dataset.row_count:,} 条 · {len(dataset.ids):,} 个 UID")
+        self.file_label.setText(f"{len(dataset.sources)} 个 CSV · {dataset.size_bytes / 1_000_000:.1f} MB · 最新 {dataset.max_day or '无日期'}\n共 {dataset.row_count:,} 条 · {len(dataset.ids):,} 个 UID")
         self.file_details_button.setEnabled(True)
-        for widget, day, check in ((self.start_date, dataset.min_day, self.start_check),
-                                   (self.end_date, dataset.max_day, self.end_check)):
-            if day and not check.isChecked():
-                widget.blockSignals(True)
-                widget.setDate(QDate(day.year, day.month, day.day))
-                widget.blockSignals(False)
         previous_order = self.order_combo.currentData()
         self.order_combo.blockSignals(True)
         self.order_combo.clear()
@@ -596,6 +668,10 @@ class MainWindow(QMainWindow):
             self.order_combo.setCurrentIndex(self.order_combo.count() - 1)
         self.order_combo.blockSignals(False)
         self.calculate()
+        self.settings.setValue("last_files", [str(source.path) for source in dataset.sources])
+        self.settings.setValue("last_directory", str(dataset.sources[0].path.parent))
+        self.settings.setValue("last_encoding", dataset.encoding)
+        self.settings.sync()
 
     def import_failed(self, message):
         self.dataset = None
@@ -631,10 +707,10 @@ class MainWindow(QMainWindow):
         try:
             result = self.dataset.query(self.get_filters())
         except DataError as exc:
-            self.invalidate_result("筛选条件无效，请修正后重试")
             self.show_error(str(exc))
             return
         self.result = result
+        self.pending_filters = False
         amount = format_money(result.total, grouping=True)
         self.total_label.setText(amount)
         self.total_label.setStyleSheet(f"font-size: {30 if len(amount) < 25 else 18}px;")
@@ -647,19 +723,12 @@ class MainWindow(QMainWindow):
         scope = f"{start} 至 {end}（含首尾） · "
         scope += f"指定 {len(set(f.ids))} 个好友" if f.ids else "所有好友"
         scope += f" · {f.order_type or '全部订单'}"
+        self.applied_scope = scope
         self.scope_label.setText(scope)
         self.models[1].set_rows([(day, a.count, a.total) for day, a in result.per_day.items()])
         self.models[2].set_rows([(day, uid, a.count, a.total) for (day, uid), a in result.daily_ids.items()])
-        counts = Counter(result.statuses.values())
-        presence = ("输入 UID 全部在所选文件中 · 未找到 0 个" if f.ids and not counts['missing'] else
-                    f"{counts['missing']} 个输入 UID 在所选文件中未找到" if counts['missing'] else
-                    f"核对批次全部 {len(result.per_id)} 个 UID")
-        self.audit_label.setText(f"{presence}\n有返佣 {counts['positive']} · 净额为负 {counts['negative']} · 净额为 0 {counts['zero']} · 当前无记录 {counts['inactive']}")
         missing = result.missing_ids
-        self.missing_label.setText(f"未找到 ID：{len(missing)} 个（所选 CSV 中）")
         self.missing_list.setPlainText("、".join(missing))
-        # Use the existing summary space for the alert; do not stack duplicate
-        # summaries and squeeze the results out of a compact window.
         self.audit_label.setVisible(not missing)
         self.missing_panel.setVisible(bool(missing))
         self.copy_missing_button.setEnabled(bool(missing))
@@ -667,6 +736,9 @@ class MainWindow(QMainWindow):
         self.warning_label.clear()
         self.warning_label.setToolTip("")
         self.warning_label.hide()
+        if f.end and self.dataset.max_day and f.end > self.dataset.max_day:
+            self.warning_label.setText(f"所选结束日期为 {f.end}，文件最新返佣记录仅到 {self.dataset.max_day}；之后暂无记录，请核对导出范围。")
+            self.warning_label.show()
         self.status_filter.blockSignals(True)
         self.status_filter.setCurrentIndex(0)
         self.status_filter.blockSignals(False)
@@ -685,12 +757,13 @@ class MainWindow(QMainWindow):
         if self.result is None:
             return
         result = self.result
+        self.update_audit_links()
         ids = result.visible_ids(self.status_filter.currentData(), self.uid_search.text())
         self.models[0].missing_ids = set(result.missing_ids)
         self.models[0].set_rows([(uid, result.per_id[uid].count, result.per_id[uid].total,
             "否" if result.statuses[uid] == "missing" else "是", STATUS_LABELS[result.statuses[uid]],
             result.lifetime_counts.get(uid, 0)) for uid in ids])
-        self.copy_ids_button.setEnabled(bool(ids))
+        self.copy_ids_button.setEnabled(bool(ids) and not self.pending_filters)
         caption = f"源文件共 {self.dataset.row_count:,} 条，本次匹配 {result.count:,} 条。"
         if is_uid:
             caption += f"\n表内 {len(ids):,}/{len(result.per_id):,} 个 UID · 状态/查找仅筛选此表，不改变总额。"
@@ -698,18 +771,48 @@ class MainWindow(QMainWindow):
             caption += "相同记录全部累计。"
         self.table_footer.setText(caption)
 
+    def update_audit_links(self):
+        result = self.result
+        if result is None:
+            return
+        counts = Counter(result.statuses.values())
+        presence = ("输入 UID 全部在所选文件中" if result.filters.ids and not counts["missing"] else
+                    f"已输入 {len(result.filters.ids)} 个 UID" if result.filters.ids else
+                    f"核对批次全部 {len(result.per_id)} 个 UID")
+        selected = self.status_filter.currentData()
+        def link(status, caption):
+            color = "#125f4d" if selected == status else "#345f54"
+            weight = "700" if selected == status else "400"
+            return f'<a href="{status}" style="color: {color}; font-weight: {weight}; text-decoration: underline;">{caption}</a>'
+        missing_caption = f"未找到 {counts['missing']} 个"
+        first = f"{presence} · {link('missing', missing_caption)}"
+        second = " · ".join((link("positive", f"有返佣 {counts['positive']}"),
+                             link("negative", f"净额为负 {counts['negative']}"),
+                             link("zero", f"净额为 0 {counts['zero']}"),
+                             link("inactive", f"当前无记录 {counts['inactive']}")))
+        self.audit_label.setText(first + "<br>" + second)
+        self.missing_label.setText(link("missing", missing_caption) + " · " + second)
+
+    def toggle_summary_filter(self, status):
+        if self.result is None or status not in ("missing", "positive", "negative", "zero", "inactive"):
+            return
+        self.uid_search.clear()
+        target = "" if self.status_filter.currentData() == status else status
+        self.status_filter.setCurrentIndex(self.status_filter.findData(target))
+        self.tabs.setCurrentIndex(0)
+
     def copy_visible_ids(self):
-        if self.result is not None:
+        if self.result is not None and not self.pending_filters:
             QApplication.clipboard().setText("\n".join(row[0] for row in self.models[0].rows))
             self.statusBar().showMessage(f"已复制表内 {len(self.models[0].rows)} 个完整 UID", 5000)
 
     def copy_missing_ids(self):
-        if self.result is not None and self.result.missing_ids:
+        if self.result is not None and not self.pending_filters and self.result.missing_ids:
             QApplication.clipboard().setText("\n".join(self.result.missing_ids))
             self.statusBar().showMessage(f"已复制 {len(self.result.missing_ids)} 个未找到的完整 ID", 5000)
 
     def show_missing_ids(self):
-        if self.result is not None and self.result.missing_ids:
+        if self.result is not None and not self.pending_filters and self.result.missing_ids:
             self.uid_search.clear()
             self.status_filter.setCurrentIndex(self.status_filter.findData("missing"))
             self.tabs.setCurrentIndex(0)
@@ -736,12 +839,12 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def copy_total(self):
-        if self.result:
+        if self.result and not self.pending_filters:
             QApplication.clipboard().setText(format_money(self.result.total))
             self.statusBar().showMessage("金额已复制（保留完整小数精度）", 5000)
 
     def export_current(self):
-        if self.result is None or self.dataset is None:
+        if self.result is None or self.dataset is None or self.pending_filters:
             return
         index = self.tabs.currentIndex()
         names = ("按好友", "按日期", "日期与好友")
@@ -783,6 +886,45 @@ class MainWindow(QMainWindow):
             event.accept()
 
 
+def instance_name():
+    project = str(Path(__file__).resolve()).encode("utf-8")
+    return f"rebate-settlement-{os.getuid()}-{hashlib.sha256(project).hexdigest()[:16]}"
+
+
+def notify_running_instance(name, paths):
+    socket = QLocalSocket()
+    socket.connectToServer(name)
+    if socket.waitForConnected(300):
+        socket.write(json.dumps(paths, ensure_ascii=False).encode("utf-8") + b"\n")
+        socket.waitForBytesWritten(300)
+        socket.disconnectFromServer()
+
+
+def serve_instance_requests(server, window):
+    while server.hasPendingConnections():
+        socket = server.nextPendingConnection()
+        data = bytearray()
+
+        def receive(socket=socket, data=data):
+            data.extend(bytes(socket.readAll()))
+            if b"\n" not in data:
+                return
+            try:
+                paths = json.loads(data.split(b"\n", 1)[0])
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                paths = []
+            window.showNormal()
+            window.raise_()
+            window.activateWindow()
+            if isinstance(paths, list) and paths and all(isinstance(path, str) for path in paths):
+                window.import_files(paths)
+            socket.disconnectFromServer()
+
+        socket.readyRead.connect(receive)
+        socket.disconnected.connect(socket.deleteLater)
+        receive()
+
+
 def main():
     parser = argparse.ArgumentParser(description="本地返佣结算工具")
     parser.add_argument("csv", nargs="*", help="启动后合并导入这些 CSV")
@@ -791,10 +933,25 @@ def main():
     app.setApplicationName("返佣结算")
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    name = instance_name()
+    lock = QLockFile(str(Path(tempfile.gettempdir()) / f"{name}.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(0):
+        notify_running_instance(name, args.csv)
+        return 0
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+    if not server.listen(name):
+        print(f"无法建立单实例通道：{server.errorString()}", file=sys.stderr)
+        return 1
     window = MainWindow()
+    server.newConnection.connect(lambda: serve_instance_requests(server, window))
     window.show()
     if args.csv:
         QTimer.singleShot(0, lambda: window.import_files(args.csv))
+    else:
+        QTimer.singleShot(0, window.restore_last_files)
     return app.exec()
 
 

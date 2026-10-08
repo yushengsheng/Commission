@@ -1,15 +1,17 @@
 from datetime import date
 from decimal import Decimal
 import time
+from uuid import uuid4
 
 import pytest
 from openpyxl import load_workbook
-from PySide6.QtCore import QDate, QMimeData, QPoint, QPointF, Qt, QTimer, QUrl
+from PySide6.QtCore import QLockFile, QMimeData, QPoint, QPointF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from app import MainWindow, MISSING_COLOR
+from app import MainWindow, MISSING_COLOR, notify_running_instance, serve_instance_requests
 from rebate_engine import load_csv
 
 
@@ -22,9 +24,46 @@ def wait_idle(window, qapp, timeout=10):
     qapp.processEvents()
 
 
+def test_second_launch_reuses_existing_instance(qapp, tmp_path):
+    first = QLockFile(str(tmp_path / "instance.lock"))
+    second = QLockFile(str(tmp_path / "instance.lock"))
+    assert first.tryLock(0)
+    assert not second.tryLock(0)
+    server = QLocalServer()
+    if not server.listen(f"rebate-test-{uuid4().hex}"):
+        first.unlock()
+        pytest.skip(f"local sockets unavailable: {server.errorString()}")
+    calls = []
+
+    class ExistingWindow:
+        def showNormal(self):
+            calls.append("show")
+
+        def raise_(self):
+            calls.append("raise")
+
+        def activateWindow(self):
+            calls.append("activate")
+
+        def import_files(self, paths):
+            calls.append(paths)
+
+    server.newConnection.connect(lambda: serve_instance_requests(server, ExistingWindow()))
+    try:
+        notify_running_instance(server.serverName(), ["a.csv", "b.csv"])
+        deadline = time.monotonic() + 1
+        while len(calls) < 4 and time.monotonic() < deadline:
+            qapp.processEvents()
+            QTest.qWait(5)
+        assert calls == ["show", "raise", "activate", ["a.csv", "b.csv"]]
+    finally:
+        server.close()
+        first.unlock()
+
+
 @pytest.fixture
-def window(qapp):
-    win = MainWindow()
+def window(qapp, tmp_path):
+    win = MainWindow(settings=QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     win.show()
     qapp.processEvents()
     yield win
@@ -39,7 +78,8 @@ def test_initial_empty_ui(window):
     assert window.total_label.text() == "—"
     assert not window.query_button.isEnabled()
     assert not window.export_button.isEnabled()
-    assert not window.start_date.isEnabled()
+    assert window.start_date.isEnabled()
+    assert window.start_date.text() == ""
 
 
 def test_picker_import_and_reimport_replace(window, make_csv, qapp, monkeypatch):
@@ -49,6 +89,7 @@ def test_picker_import_and_reimport_replace(window, make_csv, qapp, monkeypatch)
     wait_idle(window, qapp)
     assert window.result.total == Decimal("3.65")
     assert window.total_label.text() == "3.65000000"
+    assert "MB · 最新 2026-08-25" in window.file_label.text().splitlines()[0]
     window.import_file(str(path))
     wait_idle(window, qapp)
     assert window.result.count == 8
@@ -61,45 +102,102 @@ def test_picker_import_and_reimport_replace(window, make_csv, qapp, monkeypatch)
     assert "001" not in window.dataset.ids
 
 
-def test_filters_invalidating_old_results_and_copy(window, make_csv, qapp):
+def test_filters_keep_old_results_until_calculate(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)
     window.id_input.setPlainText("001，2,001")
-    assert window.result is None
+    assert window.result.total == Decimal("3.65")
+    assert window.total_label.text() == "3.65000000"
+    assert "上次统计结果" in window.scope_label.text()
     assert not window.export_button.isEnabled()
-    window.start_date.setDate(QDate(2026, 8, 18))
-    window.end_date.setDate(QDate(2026, 8, 24))
-    window.start_check.setChecked(True)
-    window.end_check.setChecked(True)
+    QTest.keyClicks(window.start_date, "20260818")
+    QTest.keyClicks(window.end_date, "20260824")
+    assert window.start_date.text() == "2026-08-18"
+    assert window.end_date.text() == "2026-08-24"
     window.query_button.click()
     assert window.result.total == Decimal("0.4")
     assert window.result.count == 3
     window.copy_button.click()
     assert qapp.clipboard().text() == "0.40000000"
     window.reset_button.click()
+    assert window.result.total == Decimal("0.4")
+    assert "上次统计结果" in window.scope_label.text()
+    assert window.start_date.text() == ""
+    assert window.end_date.text() == ""
+    window.query_button.click()
     assert window.result.total == Decimal("3.65")
-    assert not window.start_check.isChecked()
+    assert "上次统计结果" not in window.scope_label.text()
+
+
+def test_manual_date_range_counts_all_friends_and_inclusive_days(window, make_csv, qapp):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    QTest.keyClicks(window.start_date, "20260818")
+    QTest.keyClicks(window.end_date, "20260824")
+    assert window.result.total == Decimal("3.65")
+    window.query_button.click()
+    assert window.result.count == 6
+    assert window.result.total == Decimal("2.35")
+    assert window.result.filters.ids == ()
+    assert "所有好友" in window.scope_label.text()
+
+    window.start_date.clear()
+    assert window.result.total == Decimal("2.35")
+    window.query_button.click()
+    assert window.result.count == 7
+    assert window.result.total == Decimal("3.35")
+
+
+def test_date_digits_insert_separators_without_picker(window):
+    QTest.keyClicks(window.start_date, "20260920")
+    assert window.start_date.text() == "2026-09-20"
+    QTest.keyClick(window.start_date, Qt.Key.Key_Backspace)
+    QTest.keyClick(window.start_date, Qt.Key.Key_Backspace)
+    assert window.start_date.text() == "2026-09"
+    QTest.keyClicks(window.start_date, "30")
+    assert window.start_date.text() == "2026-09-30"
+
+
+@pytest.mark.parametrize("value", ["2026/08/18", "2026-02-30", "2026-8-18", "2026-08-18 12:00:00"])
+def test_invalid_manual_date_keeps_old_result_without_stale_export(window, make_csv, qapp, value):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    window.start_date.setText(value)
+    window.query_button.click()
+    assert window.result.total == Decimal("3.65")
+    assert window.total_label.text() == "3.65000000"
+    assert not window.export_button.isEnabled()
+    assert "开始日期" in window.warning_label.text()
 
 
 def test_reversed_dates_no_stale_export(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)
-    window.start_date.setDate(QDate(2026, 8, 25))
-    window.end_date.setDate(QDate(2026, 8, 18))
-    window.start_check.setChecked(True)
-    window.end_check.setChecked(True)
+    window.start_date.setText("2026-08-25")
+    window.end_date.setText("2026-08-18")
     window.calculate()
-    assert window.result is None
+    assert window.result.total == Decimal("3.65")
     assert "开始日期" in window.warning_label.text()
     assert not window.export_button.isEnabled()
 
 
-def test_no_stale_footer_or_error_tooltip(window, make_csv, qapp):
+def test_date_range_past_csv_coverage_shows_warning(window, make_csv, qapp):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    window.end_date.setText("2026-08-30")
+    window.calculate()
+    assert window.result.total == Decimal("3.65")
+    assert "文件最新返佣记录仅到 2026-08-25" in window.warning_label.text()
+    assert window.warning_label.isVisible()
+
+
+def test_pending_filters_keep_footer_and_clear_error_tooltip(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)
     assert "本次匹配 8 条" in window.table_footer.text()
     window.id_input.setPlainText("999")
-    assert "本次匹配" not in window.table_footer.text()
+    assert "本次匹配 8 条" in window.table_footer.text()
+    assert "上次统计结果" in window.scope_label.text()
     window.warning_label.setToolTip("旧的 UID 名单")
     window.show_error("新的错误")
     assert window.warning_label.toolTip() == ""
@@ -274,17 +372,73 @@ def test_multi_picker_and_batch_replacement(window, make_csv, qapp, monkeypatch)
     assert window.dataset.ids == frozenset({"999"})
 
 
+def test_remembers_last_successful_batch_and_picker_directory(window, make_csv, qapp, monkeypatch, tmp_path):
+    a = make_csv(filename="a.csv")
+    b = make_csv(filename="b.csv")
+    window.import_files([a, b])
+    wait_idle(window, qapp)
+    settings_file = window.settings.fileName()
+    reopened = MainWindow(settings=QSettings(settings_file, QSettings.Format.IniFormat))
+    reopened.show()
+    try:
+        reopened.restore_last_files()
+        wait_idle(reopened, qapp)
+        assert {source.path for source in reopened.dataset.sources} == {a.resolve(), b.resolve()}
+        assert reopened.result.count == 16
+        seen = []
+        replacement = make_csv([["spot", "9", "0", "4", "2026-08-19"]], filename="new.csv")
+        def pick(*args):
+            seen.append(args[2])
+            return [str(replacement)], "CSV"
+        monkeypatch.setattr(QFileDialog, "getOpenFileNames", pick)
+        reopened.choose_file()
+        wait_idle(reopened, qapp)
+        assert seen == [str(tmp_path)]
+        assert reopened.result.total == 4
+        saved = QSettings(settings_file, QSettings.Format.IniFormat)
+        assert saved.value("last_files") == [str(replacement.resolve())]
+    finally:
+        reopened.close()
+
+
+def test_failed_replacement_keeps_last_successful_file(window, make_csv, qapp):
+    good = make_csv()
+    window.import_file(good)
+    wait_idle(window, qapp)
+    previous = window.settings.value("last_files")
+    bad = make_csv([["spot", "8", "0", "bad", "2026-08-19"]], filename="bad.csv")
+    window.import_file(bad)
+    wait_idle(window, qapp)
+    assert window.dataset is None
+    assert window.settings.value("last_files") == previous
+
+
+def test_restore_uses_saved_encoding(window, make_csv, qapp):
+    path = make_csv(encoding="gb18030")
+    window.encoding_combo.setCurrentIndex(window.encoding_combo.findData("gb18030"))
+    window.import_file(path)
+    wait_idle(window, qapp)
+    reopened = MainWindow(settings=QSettings(window.settings.fileName(), QSettings.Format.IniFormat))
+    reopened.show()
+    try:
+        reopened.restore_last_files()
+        wait_idle(reopened, qapp)
+        assert reopened.encoding_combo.currentData() == "gb18030"
+        assert reopened.result.total == Decimal("3.65")
+    finally:
+        reopened.close()
+
+
 def test_complete_26_uid_list_status_search_and_copy(window, make_csv, qapp):
     ids = [str(10000000 + i) for i in range(26)]
     path = make_csv([["spot", uid, "0", "1", "2026-08-17"] for uid in ids])
     window.import_file(str(path))
     wait_idle(window, qapp)
     window.id_input.setPlainText("\n".join(ids + ["99999999"]))
-    window.start_date.setDate(QDate(2026, 8, 18))
-    window.start_check.setChecked(True)
+    window.start_date.setText("2026-08-18")
     window.calculate()
     assert len(window.models[0].rows) == 27
-    assert "1 个输入 UID" in window.audit_label.text()
+    assert "未找到 1 个" in window.audit_label.text()
     assert "当前无记录 26" in window.audit_label.text()
     assert not window.warning_label.isVisible()
     window.status_filter.setCurrentIndex(window.status_filter.findData("inactive"))
@@ -296,7 +450,8 @@ def test_complete_26_uid_list_status_search_and_copy(window, make_csv, qapp):
     assert len(window.models[0].rows) == 1
     assert window.models[0].rows[0][0] == "10000025"
     window.id_input.clear()
-    assert window.result is None and not window.copy_ids_button.isEnabled()
+    assert window.result is not None and not window.copy_ids_button.isEnabled()
+    assert "上次统计结果" in window.scope_label.text()
 
 
 def test_status_filter_keeps_settlement_total_and_export_matches_view(window, make_csv, tmp_path, qapp, monkeypatch):
@@ -315,6 +470,51 @@ def test_status_filter_keeps_settlement_total_and_export_matches_view(window, ma
     assert len(rows) == 1 and rows[0]["好友ID（现货）"] == "4"
     window.tabs.setCurrentIndex(1)
     assert not window.uid_controls.isVisible()
+
+
+def test_summary_counts_toggle_uid_table_filter(window, make_csv, qapp):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    window.id_input.setPlainText("001 2 12 123 3 4")
+    window.start_date.setText("2026-08-18")
+    window.end_date.setText("2026-08-24")
+    window.calculate()
+    total = window.result.total
+    assert window.audit_label.isVisible()
+    for status, expected in (("positive", {"001", "2", "123"}),
+                             ("negative", {"3"}), ("zero", {"4"}),
+                             ("inactive", {"12"}), ("missing", set())):
+        assert f'href="{status}"' in window.audit_label.text()
+        window.uid_search.setText("001")
+        window.tabs.setCurrentIndex(1)
+        window.audit_label.linkActivated.emit(status)
+        assert window.tabs.currentIndex() == 0
+        assert window.uid_search.text() == ""
+        assert window.status_filter.currentData() == status
+        assert {row[0] for row in window.models[0].rows} == expected
+        assert window.result.total == total
+        window.audit_label.linkActivated.emit(status)
+        assert window.status_filter.currentData() == ""
+        assert len(window.models[0].rows) == 6
+
+
+def test_missing_count_link_toggles_missing_uid_rows(window, make_csv, qapp):
+    window.import_file(str(make_csv()))
+    wait_idle(window, qapp)
+    window.id_input.setPlainText("001 999")
+    window.calculate()
+    assert window.missing_panel.isVisible()
+    assert 'href="missing"' in window.missing_label.text()
+    assert 'href="positive"' in window.missing_label.text()
+    window.missing_label.linkActivated.emit("missing")
+    assert window.status_filter.currentData() == "missing"
+    assert [row[0] for row in window.models[0].rows] == ["999"]
+    window.missing_label.linkActivated.emit("missing")
+    assert window.status_filter.currentData() == ""
+    assert {row[0] for row in window.models[0].rows} == {"001", "999"}
+    window.missing_label.linkActivated.emit("positive")
+    assert window.status_filter.currentData() == "positive"
+    assert [row[0] for row in window.models[0].rows] == ["001"]
 
 
 def test_bad_second_file_clears_previous_batch(window, make_csv, qapp):
@@ -386,11 +586,10 @@ def test_missing_ids_have_complete_red_record_and_copy(window, make_csv, qapp):
     wait_idle(window, qapp)
     missing = [str(9000000000 + i) for i in range(26)]
     window.id_input.setPlainText("\n".join(["001", "12", "4", *missing, missing[0]]))
-    window.start_date.setDate(QDate(2026, 8, 18))
-    window.start_check.setChecked(True)
+    window.start_date.setText("2026-08-18")
     window.calculate()
     assert window.missing_panel.isVisible()
-    assert window.missing_label.text() == "未找到 ID：26 个（所选 CSV 中）"
+    assert "未找到 26 个" in window.missing_label.text()
     assert window.missing_list.toPlainText().split("、") == missing
     window.resize(960, 680)
     qapp.processEvents()
@@ -418,16 +617,17 @@ def test_missing_ids_have_complete_red_record_and_copy(window, make_csv, qapp):
     assert window.missing_list.toPlainText().split("、") == missing
 
 
-def test_missing_record_clears_when_conditions_change_or_batch_replaced(window, make_csv, qapp):
+def test_missing_record_stays_until_recalculated_or_batch_replaced(window, make_csv, qapp):
     window.import_file(str(make_csv()))
     wait_idle(window, qapp)
     window.id_input.setPlainText("999")
     window.calculate()
     assert window.missing_panel.isVisible()
     window.id_input.setPlainText("001")
-    assert not window.missing_panel.isVisible()
+    assert window.missing_panel.isVisible()
     assert not window.copy_missing_button.isEnabled()
-    assert window.missing_list.toPlainText() == ""
+    assert window.missing_list.toPlainText() == "999"
+    assert "上次统计结果" in window.scope_label.text()
     window.calculate()
     assert "未找到 0 个" in window.audit_label.text()
     assert window.audit_label.isVisible()
